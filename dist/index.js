@@ -5,46 +5,56 @@ import { ErrorCode, McpError, ListToolsRequestSchema, CallToolRequestSchema } fr
 import axios from 'axios';
 import fs from 'fs/promises';
 
-// Load site config from config file
+// Load site config from either WP_SITES_JSON (inline JSON blob) or WP_SITES_PATH (file).
+// WP_SITES_JSON wins when both are set — useful for env-only deployments (Paperclip).
 async function loadSiteConfig() {
+	const inlineJson = process.env.WP_SITES_JSON;
 	const configPath = process.env.WP_SITES_PATH;
-	if (!configPath) {
-		throw new Error("WP_SITES_PATH environment variable is required");
-	}
 
-	try {
-		const configData = await fs.readFile(configPath, 'utf8');
-		const config = JSON.parse(configData);
-		
-		// Validate and normalize the config
-		const normalizedConfig = {};
-		for (const [alias, site] of Object.entries(config)) {
-			if (!site.URL || !site.USER || !site.PASS) {
-				console.error(`Invalid configuration for site ${alias}: missing required fields`);
-				continue;
+	let rawConfig;
+	if (inlineJson) {
+		try {
+			rawConfig = JSON.parse(inlineJson);
+		} catch (error) {
+			throw new Error(`WP_SITES_JSON is not valid JSON: ${error.message}`);
+		}
+	} else if (configPath) {
+		try {
+			const configData = await fs.readFile(configPath, 'utf8');
+			rawConfig = JSON.parse(configData);
+		} catch (error) {
+			if (error.code === 'ENOENT') {
+				throw new Error(`Config file not found at: ${configPath}`);
 			}
-
-			normalizedConfig[alias.toLowerCase()] = {
-				url: site.URL.replace(/\/$/, ''),
-				username: site.USER,
-				auth: site.PASS
-			};
+			throw new Error(`Failed to load config: ${error.message}`);
 		}
-
-		return normalizedConfig;
-	} catch (error) {
-		if (error.code === 'ENOENT') {
-			throw new Error(`Config file not found at: ${configPath}`);
-		}
-		throw new Error(`Failed to load config: ${error.message}`);
+	} else {
+		throw new Error("Either WP_SITES_JSON or WP_SITES_PATH environment variable is required");
 	}
+
+	const normalizedConfig = {};
+	for (const [alias, site] of Object.entries(rawConfig)) {
+		if (!site.URL || !site.USER || !site.PASS) {
+			console.error(`Invalid configuration for site ${alias}: missing required fields`);
+			continue;
+		}
+		normalizedConfig[alias.toLowerCase()] = {
+			url: site.URL.replace(/\/$/, ''),
+			username: site.USER,
+			auth: site.PASS
+		};
+	}
+	return normalizedConfig;
 }
 
-// WordPress client class
+// WordPress client — uses ?rest_route= URL pattern instead of /wp-json/* permalink.
+// Hostinger LiteSpeed WAF (and similar shared-hosting WAFs) blocks authenticated
+// requests to /wp-json/* with 403; the query-string form bypasses that rule
+// while remaining a fully supported WordPress REST API entry point.
 class WordPressClient {
 	constructor(site) {
 		const config = {
-			baseURL: `${site.url}/wp-json`,
+			baseURL: site.url,
 			headers: {
 				'Content-Type': 'application/json',
 				'Accept': 'application/json'
@@ -60,7 +70,7 @@ class WordPressClient {
 	}
 
 	async discoverEndpoints() {
-		const response = await this.client.get('/');
+		const response = await this.client.get('/', { params: { rest_route: '/' } });
 		const routes = response.data?.routes ?? {};
 		return Object.entries(routes).map(([path, info]) => ({
 			methods: info.methods ?? [],
@@ -71,10 +81,10 @@ class WordPressClient {
 
 	async makeRequest(endpoint, method = 'GET', params) {
 		const path = endpoint.replace(/^\/wp-json/, '').replace(/^\/?/, '/');
-		const config = { method, url: path };
-		
+		const config = { method, url: '/', params: { rest_route: path } };
+
 		if (method === 'GET' && params) {
-			config.params = params;
+			config.params = { ...config.params, ...params };
 		} else if (params) {
 			config.data = params;
 		}
@@ -84,10 +94,8 @@ class WordPressClient {
 	}
 }
 
-// Start the server
 async function main() {
 	try {
-		// Load configuration
 		const siteConfig = await loadSiteConfig();
 		const clients = new Map();
 
@@ -95,15 +103,13 @@ async function main() {
 			clients.set(alias, new WordPressClient(site));
 		}
 
-		// Initialize server
 		const server = new Server({
 			name: "server-wp-mcp",
-			version: "1.0.0"
+			version: "1.1.0"
 		}, {
 			capabilities: { tools: {} }
 		});
 
-		// Tool definitions
 		server.setRequestHandler(ListToolsRequestSchema, async () => ({
 			tools: [{
 				name: "wp_discover_endpoints",
@@ -121,30 +127,28 @@ async function main() {
 				inputSchema: {
 					type: "object",
 					properties: {
-						site: { type: "string" },
-						endpoint: { type: "string" },
-						method: { type: "string", enum: ["GET", "POST", "PUT", "DELETE", "PATCH"] },
-						params: { type: "object" }
+						site: { type: "string", description: "Site alias" },
+						endpoint: { type: "string", description: "API endpoint path" },
+						method: { type: "string", enum: ["GET", "POST", "PUT", "DELETE", "PATCH"], default: "GET" },
+						params: { type: "object", description: "Request parameters or body" }
 					},
 					required: ["site", "endpoint"]
 				}
 			}]
 		}));
 
-		// Tool handlers
 		server.setRequestHandler(CallToolRequestSchema, async (request) => {
 			const { name, arguments: args } = request.params;
-
+			const client = clients.get(args.site?.toLowerCase());
+			if (!client) {
+				throw new McpError(ErrorCode.InvalidParams, `Unknown site: ${args.site}`);
+			}
 			switch (name) {
 				case "wp_discover_endpoints": {
-					const client = clients.get(args.site.toLowerCase());
-					if (!client) throw new McpError(ErrorCode.InvalidParams, `Unknown site: ${args.site}`);
 					const endpoints = await client.discoverEndpoints();
 					return { content: [{ type: "text", text: JSON.stringify(endpoints, null, 2) }] };
 				}
 				case "wp_call_endpoint": {
-					const client = clients.get(args.site.toLowerCase());
-					if (!client) throw new McpError(ErrorCode.InvalidParams, `Unknown site: ${args.site}`);
 					const result = await client.makeRequest(args.endpoint, args.method, args.params);
 					return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
 				}
@@ -153,10 +157,9 @@ async function main() {
 			}
 		});
 
-		// Start server
 		const transport = new StdioServerTransport();
 		await server.connect(transport);
-		
+
 		console.error(`WordPress MCP server started with ${clients.size} site(s) configured`);
 	} catch (error) {
 		console.error(`Server failed to start: ${error.message}`);

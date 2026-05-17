@@ -1,7 +1,10 @@
 {
 	"name": "server-wp-mcp",
-	"version": "1.0.0",
+	"version": "1.1.0",
 	"main": "dist/index.js",
+	"bin": {
+		"server-wp-mcp": "dist/index.js"
+	},
 	"type": "module",
 	"scripts": {
 		"start": "node dist/index.js"
@@ -10,6 +13,10 @@
 	"author": "mzimmer",
 	"license": "MIT",
 	"description": "The WordPress MCP server enables AI assistants to interact with WordPress sites through a standardized interface. It handles authentication and provides a secure way to discover and interact with WordPress REST API endpoints.",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/healdigital/server-wp-mcp.git"
+	},
 	"dependencies": {
 		"@modelcontextprotocol/sdk": "^1.0.4",
 		"axios": "^1.7.9"
